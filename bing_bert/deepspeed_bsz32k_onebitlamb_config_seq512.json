@@ -11,8 +11,8 @@
       "bias_correction": false,
       "max_coeff": 0.3,
       "min_coeff": 0.01,
-      "freeze_step": 100,
-      "update_window": 100
+      "freeze_step": 10000,
+      "cuda_aware": true
     }
   },
   "gradient_clipping": 1.0,

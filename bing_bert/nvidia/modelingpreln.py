@@ -43,7 +43,6 @@ from torch.nn.parameter import Parameter
 import torch.nn.functional as F
 import torch.nn.init as init
 
-
 logger = logging.getLogger(__name__)
 
 PRETRAINED_MODEL_ARCHIVE_MAP = {
@@ -107,11 +106,13 @@ def get_sparse_attention_config(args, num_heads):
     else:
         return None
 
+
 def get_sparse_attention_utils(sparse_attention_config):
     if sparse_attention_config is not None:
         from deepspeed.ops.sparse_attention import SparseAttentionUtils
         return SparseAttentionUtils
     return None
+
 
 def load_tf_weights_in_bert(model, tf_checkpoint_path):
     """ Load tf checkpoints in a pytorch model
@@ -998,7 +999,8 @@ class BertModel(BertPreTrainedModel):
         # set sparse_attention_config if it has been selected
         self.sparse_attention_config = get_sparse_attention_config(
             args, config.num_attention_heads)
-        self.sparse_attention_utils = get_sparse_attention_utils(self.sparse_attention_config)
+        self.sparse_attention_utils = get_sparse_attention_utils(
+            self.sparse_attention_config)
         self.encoder = BertEncoder(
             config, args, sparse_attention_config=self.sparse_attention_config)
         self.pooler = BertPooler(config)
@@ -1055,8 +1057,9 @@ class BertModel(BertPreTrainedModel):
 
         # If BertEncoder uses sparse attention, and input_ids were padded, sequence output needs to be unpadded to original length
         if self.sparse_attention_config is not None and pad_len > 0:
-            encoded_layers[-1] = self.sparse_attention_utils.unpad_sequence_output(
-                pad_len, encoded_layers[-1])
+            encoded_layers[
+                -1] = self.sparse_attention_utils.unpad_sequence_output(
+                    pad_len, encoded_layers[-1])
 
         if not output_all_encoded_layers:
             encoded_layers = encoded_layers[-1]
@@ -1146,12 +1149,47 @@ class BertForPreTrainingPreLN(BertPreTrainedModel):
                                         masked_token_indexes)
 
             loss_fct = CrossEntropyLoss(ignore_index=-1)
-            masked_lm_loss = loss_fct(
-                prediction_scores.view(-1, self.config.vocab_size), target)
-            next_sentence_loss = loss_fct(seq_relationship_score.view(-1, 2),
-                                          next_sentence_label.view(-1))
+            # masked_lm_loss = loss_fct(
+            #     prediction_scores.view(-1, self.config.vocab_size), target)
+            # next_sentence_loss = loss_fct(seq_relationship_score.view(-1, 2),
+            #                               next_sentence_label.view(-1))
+            # total_loss = masked_lm_loss + next_sentence_loss
+            # return total_loss
+            prediction_scores = prediction_scores.view(-1,
+                                                       self.config.vocab_size)
+            seq_relationship_score = seq_relationship_score.view(-1, 2)
+            next_sentence_label = next_sentence_label.view(-1)
+            masked_lm_loss = loss_fct(prediction_scores, target)
+            next_sentence_loss = loss_fct(seq_relationship_score,
+                                          next_sentence_label)
             total_loss = masked_lm_loss + next_sentence_loss
-            return total_loss
+            if log:
+                return total_loss, 0, 0, 0, 0, 0, 0
+
+            masked_lm_total = torch.tensor([
+                prediction_scores.size()[0]
+            ]).half().reshape(1).to(self.args.device)
+            next_sentence_total = torch.tensor([
+                seq_relationship_score.size()[0]
+            ]).half().reshape(1).to(self.args.device)
+            masked_lm_prediction = torch.max(prediction_scores, 1)[0]
+            next_sentence_prediction = torch.max(seq_relationship_score, 1)[0]
+            masked_lm_target = prediction_scores.gather(
+                1,
+                target.long().view(-1, 1)).reshape(-1)
+            next_sentence_target = seq_relationship_score.gather(
+                1,
+                next_sentence_label.long().view(-1, 1)).reshape(-1)
+            masked_lm_hit = torch.eq(masked_lm_prediction,
+                                     masked_lm_target).sum().half().reshape(1)
+            next_sentence_hit = torch.eq(
+                next_sentence_prediction,
+                next_sentence_target).sum().half().reshape(1)
+            return total_loss.reshape(1), masked_lm_loss.reshape(
+                1
+            ), next_sentence_loss.reshape(
+                1
+            ), masked_lm_hit, masked_lm_total, next_sentence_hit, next_sentence_total
         else:
             prediction_scores, seq_relationship_score = self.cls(
                 sequence_output, pooled_output)

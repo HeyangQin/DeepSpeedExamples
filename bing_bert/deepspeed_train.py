@@ -101,21 +101,64 @@ def pretrain_validation(args, index, model):
     data_batches = get_dataloader(args, dataset, eval_set=True)
     eval_loss = 0
     nb_eval_steps = 0
+    masked_lm_loss, masked_lm_hit, masked_lm_total, next_sentence_loss, next_sentence_hit, next_sentence_total = 0, 0, 0, 0, 0, 0
     for batch in tqdm(data_batches):
         batch = tuple(t.to(args.device) for t in batch)
-        tmp_eval_loss = model.network(batch, log=False)
-        dist.reduce(tmp_eval_loss, 0)
+        # tmp_eval_loss = model.network(batch, log=False)
+        # dist.reduce(tmp_eval_loss, 0)
+        tmp_results = model.network(batch, log=False)
+        tmp_results = torch.stack(tmp_results, dim=0)
+        dist.reduce(tmp_results, 0)
         # Reduce to get the loss from all the GPU's
-        tmp_eval_loss = tmp_eval_loss / dist.get_world_size()
+        # tmp_eval_loss = tmp_eval_loss / dist.get_world_size()
+        tmp_eval_loss = tmp_results[0] / dist.get_world_size()
         eval_loss += tmp_eval_loss.mean().item()
         nb_eval_steps += 1
+
+        tmp_masked_lm_loss = tmp_results[1] / dist.get_world_size()
+        masked_lm_loss += tmp_masked_lm_loss.mean().item()
+
+        tmp_next_sentence_loss = tmp_results[2] / dist.get_world_size()
+        next_sentence_loss += tmp_next_sentence_loss.mean().item()
+
+        masked_lm_hit += tmp_results[3].item()
+        masked_lm_total += tmp_results[4].item()
+        next_sentence_hit += tmp_results[5].item()
+        next_sentence_total += tmp_results[6].item()
+    logger.info(
+        f"Validation masked_lm_hit {masked_lm_hit} masked_lm_total {masked_lm_total} next_sentence_hit {next_sentence_hit} next_sentence_total {next_sentence_total}"
+    )
     eval_loss = eval_loss / nb_eval_steps
     logger.info(f"Validation Loss for epoch {index + 1} is: {eval_loss}")
+    masked_lm_loss = masked_lm_loss / nb_eval_steps
+    logger.info(
+        f"Validation Loss masked lm for epoch {index + 1} is: {masked_lm_loss}"
+    )
+    next_sentence_loss = next_sentence_loss / nb_eval_steps
+    logger.info(
+        f"Validation Loss next sentence for epoch {index + 1} is: {next_sentence_loss}"
+    )
+    masked_lm_accu = float(masked_lm_hit) / masked_lm_total
+    logger.info(
+        f"Validation Accuracy masked lm for epoch {index + 1} is: {masked_lm_accu}"
+    )
+    next_sentence_accu = float(next_sentence_hit) / next_sentence_total
+    logger.info(
+        f"Validation Accuracy next sentence for epoch {index + 1} is: {next_sentence_accu}"
+    )
     if (not args.no_cuda
             and dist.get_rank() == 0) or (args.no_cuda
                                           and args.local_rank == -1):
         args.summary_writer.add_scalar(f'Validation/Loss', eval_loss,
                                        index + 1)
+        # args.summary_writer.add_scalar(f'Validation/Masked_LM_Loss', masked_lm_loss,
+        #                                index + 1)
+        # args.summary_writer.add_scalar(f'Validation/Next_Sentence_Loss', next_sentence_loss,
+        #                                index + 1)
+        # args.summary_writer.add_scalar(f'Validation/Masked_LM_Accuracy', masked_lm_accu,
+        #                                index + 1)
+        # args.summary_writer.add_scalar(f'Validation/Next_Sentence_Accuracy', next_sentence_accu,
+        #                                index + 1)
     return
 
 
@@ -164,7 +207,7 @@ def train(args,
             batch = tuple(t.to(args.device) for t in batch)  # Move to GPU
 
             # Calculate forward pass
-            loss = model.network(batch)
+            loss = (model.network(batch))[0]
             unscaled_loss = loss.item()
             current_data_sample_count += (args.train_micro_batch_size_per_gpu *
                                           dist.get_world_size())
@@ -284,7 +327,6 @@ def report_step_metrics(args, lr, loss, step, data_sample_count):
 def report_lamb_coefficients(args, optimizer, optimizer_parameter_names):
     if master_process(args):
         if (args.fp16 and args.use_lamb):
-            #print("Lamb Coeffs", optimizer.optimizer.get_lamb_coeffs())
             lamb_coeffs = optimizer.optimizer.get_lamb_coeffs()
             if len(lamb_coeffs) > 0:
                 for i in range(len(lamb_coeffs)):
@@ -292,10 +334,27 @@ def report_lamb_coefficients(args, optimizer, optimizer_parameter_names):
                         'Lamb/coeff_{}_{}'.format(
                             i, optimizer_parameter_names[i]), lamb_coeffs[i],
                         global_step)
-            lamb_coeffs = np.array(lamb_coeffs)
-            if lamb_coeffs.size > 0:
-                args.summary_writer.add_histogram(f'Train/lamb_coeffs',
-                                                  lamb_coeffs, global_step)
+        if (args.fp16 and args.use_onebit_lamb):
+            #print("Lamb Coeffs", optimizer.optimizer.get_lamb_coeffs())
+            results = optimizer.optimizer.get_lamb_coeffs()
+            idx = list(range(39)) + list(range(279, 302))
+            tags = [
+                'Lamb', 'weight_norms', 'update_norms', 'momentum_norms',
+                'variance_norms', 'error_worker_norms', 'error_server_norms',
+                'ratios_raw', 'ratios'
+            ]
+            for t_idx in range(len(tags)):
+                if len(results) > t_idx and len(results[t_idx]) > 0:
+                    # for i in range(len(lamb_coeffs)):
+                    for i in idx:
+                        args.summary_writer.add_scalar(
+                            '{}/coeff_{}_{}'.format(
+                                tags[t_idx], i, optimizer_parameter_names[i]),
+                            results[t_idx][i], global_step)
+            # lamb_coeffs = np.array(lamb_coeffs)
+            # if lamb_coeffs.size > 0:
+            #     args.summary_writer.add_histogram(f'Train/lamb_coeffs',
+            #                                       lamb_coeffs, global_step)
 
 
 def get_arguments():
@@ -441,16 +500,12 @@ def prepare_optimizer_parameters(args, model):
         'params':
         [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
         'weight_decay':
-        weight_decay,
-        'no_freeze':
-        False
+        weight_decay
     }, {
         'params':
         [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
         'weight_decay':
-        0.0,
-        'no_freeze':
-        False
+        0.0
     }]
 
     optimizer_parameter_names_1 = [
@@ -460,6 +515,14 @@ def prepare_optimizer_parameters(args, model):
         n for n, p in param_optimizer if any(nd in n for nd in no_decay)
     ]
     optimizer_parameter_names = optimizer_parameter_names_1 + optimizer_parameter_names_2
+    idx = 0
+    for group in optimizer_grouped_parameters:
+        for p in group['params']:
+            print(
+                'param {} {} shape is'.format(idx,
+                                              optimizer_parameter_names[idx]),
+                p.data.shape)
+            idx += 1
     return optimizer_grouped_parameters, optimizer_parameter_names
 
 
@@ -492,11 +555,11 @@ def prepare_model_optimizer(args):
     model.set_device(args.device)
     args.fp16 = model.network.fp16_enabled()
     args.use_lamb = (model.network.optimizer_name() ==
-                     deepspeed.runtime.config.LAMB_OPTIMIZER
-                     or model.network.optimizer_name() ==
-                     deepspeed.runtime.config.ONEBIT_LAMB_OPTIMIZER
-                     or model.network.optimizer_name() ==
-                     deepspeed.runtime.config.ONEBIT_LAMB_OPTIMIZER_SIMULATE)
+                     deepspeed.runtime.config.LAMB_OPTIMIZER)
+    args.use_onebit_lamb = (model.network.optimizer_name() ==
+                            deepspeed.runtime.config.ONEBIT_LAMB_OPTIMIZER
+                            or model.network.optimizer_name() == deepspeed.
+                            runtime.config.ONEBIT_LAMB_OPTIMIZER_SIMULATE)
 
     # Prepare Summary Writer and saved_models path
     if dist.get_rank() == 0:

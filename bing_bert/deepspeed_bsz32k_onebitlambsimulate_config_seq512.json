@@ -11,8 +11,7 @@
       "bias_correction": false,
       "max_coeff": 0.3,
       "min_coeff": 0.01,
-      "freeze_step": 10000,
-      "update_window": 1
+      "freeze_step": 10000
     }
   },
   "gradient_clipping": 1.0,
